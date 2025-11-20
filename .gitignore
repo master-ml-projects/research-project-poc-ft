@@ -1,0 +1,4 @@
+models/
+notebook_outputs/
+outputs/
+python train_chat_sft.py --model_na.txt
