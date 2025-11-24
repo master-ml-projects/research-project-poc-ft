@@ -21,7 +21,7 @@ MODEL_ID = r"models/tinyllama-1.1b-chat"
 # DATASET_ID = "HuggingFaceH4/ultrachat_200k"
 DATASET_ID = "zwhe99/DeepMath-103K"
 # TRAIN_SPLIT = "train_sft[:1%]"                    # keep small while debugging
-TRAIN_SPLIT = "train[:5%]"                  # use full train split for real training
+TRAIN_SPLIT = "train[:10%]"                  # use full train split for real training
 # OUTPUT_DIR = "outputs/mistral7b_lora_ultrachat_manual"
 OUTPUT_DIR = "outputs/tinyllama_lora_deepmath_manual"
 
@@ -29,8 +29,8 @@ USE_LORA = True          # False -> full finetune (all weights)
 MAX_SEQ_LEN = 1024       # lower if you hit OOM
 EPOCHS = 1
 BATCH_SIZE = 1
-LEARNING_RATE = 2e-4
-WARMUP_RATIO = 0.03
+LEARNING_RATE = 5e-4
+WARMUP_RATIO = 0.05
 
 LORA_R = 16
 LORA_ALPHA = 32
@@ -210,32 +210,63 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    global_step = 0
+    GRAD_ACCUM_STEPS = 4  # effective batch size = 4 * BATCH_SIZE
+
+    loss_log = []   # to store (batch_index, raw_loss)
+    epoch_log = []  # final loss per epoch (per optimizer step)
+
+    global_step = 0  # counts optimizer steps
+
     for epoch in range(EPOCHS):
         print(f"\nEpoch {epoch+1}/{EPOCHS}")
-        progress = tqdm(train_loader, desc=f"Epoch {epoch+1}")
-        running_loss = 0.0
 
-        for batch in progress:
-            # batch has input_ids, attention_mask, labels
+        # we want access to the index -> use enumerate
+        progress = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch+1}")
+        running_loss = 0.0
+        avg_loss = 0.0
+
+        optimizer.zero_grad(set_to_none=True)
+
+        for batch_idx, batch in progress:
             batch = {k: v.to(device) for k, v in batch.items()}
 
             outputs = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
-                labels=batch["labels"],  # LM head will shift and compute CE loss
+                labels=batch["labels"],
             )
-            loss = outputs.loss
+            raw_loss = outputs.loss  # unscaled, for logging
 
-            optimizer.zero_grad(set_to_none=True)
+            # ---- LOG PER BATCH (for plots) ----
+            # use a simple monotonically increasing batch index
+            loss_log.append((epoch * len(train_loader) + batch_idx + 1, raw_loss.item()))
+
+            # scale loss for gradient accumulation
+            loss = raw_loss / GRAD_ACCUM_STEPS
             loss.backward()
-            optimizer.step()
-            scheduler.step()
 
-            global_step += 1
-            running_loss += loss.item()
-            avg_loss = running_loss / global_step
-            progress.set_postfix(loss=loss.item(), avg_loss=avg_loss)
+            # do an optimizer step every GRAD_ACCUM_STEPS,
+            # or at the very end of the epoch if it's not divisible
+            if ((batch_idx + 1) % GRAD_ACCUM_STEPS == 0) or ((batch_idx + 1) == len(train_loader)):
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
+                global_step += 1
+                running_loss += raw_loss.item()
+                avg_loss = running_loss / global_step
+
+                progress.set_postfix(loss=raw_loss.item(), avg_loss=avg_loss)
+
+        # ---- LOG PER EPOCH ----
+        epoch_log.append(avg_loss)
+
+    # Save logs
+    import json
+    with open(os.path.join(OUTPUT_DIR, "loss_log.json"), "w") as f:
+        json.dump({"loss_log": loss_log, "epoch_log": epoch_log}, f, indent=2)
+
+    print("Loss logs saved to loss_log.json")
 
     print("Training finished. Saving LoRA model + tokenizer to:", OUTPUT_DIR)
     model.save_pretrained(OUTPUT_DIR)
